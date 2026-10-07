@@ -1,39 +1,6 @@
 import pytest
-from fastapi.testclient import TestClient
 
-import db
-from main import app
-
-
-@pytest.fixture
-def client(tmp_path):
-    """Each test gets its own empty database file, so tests never affect each other."""
-    path = str(tmp_path / "test.db")
-
-    def override():
-        conn = db.connect(path)
-        db.init_db(conn)
-        try:
-            yield conn
-        finally:
-            conn.close()
-
-    app.dependency_overrides[db.get_db] = override
-    yield TestClient(app)
-    app.dependency_overrides.clear()
-
-
-def make_borrower(client, email="asha@example.com"):
-    r = client.post("/borrowers", json={"full_name": "Asha Rao", "email": email})
-    assert r.status_code == 201
-    return r.json()["id"]
-
-
-def loan_payload(borrower_id, **overrides):
-    data = {"borrower_id": borrower_id, "principal_rupees": "100000",
-            "annual_rate_pct": 12, "tenure_months": 12, "start_date": "2026-01-15"}
-    data.update(overrides)
-    return data
+from helpers import loan_payload, make_borrower
 
 
 def test_create_borrower_and_reject_duplicate_email(client):

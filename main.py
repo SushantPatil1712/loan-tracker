@@ -105,3 +105,90 @@ def _get_loan_or_404(db: sqlite3.Connection, loan_id: int) -> dict:
     if not row:
         raise HTTPException(404, "Loan not found")
     return dict(row)
+
+
+# ---------- Payments ----------
+
+class PayIn(BaseModel):
+    paid_on: date | None = None      # defaults to today
+
+
+@app.post("/installments/{installment_id}/pay")
+def pay_installment(
+    installment_id: int,
+    payment: PayIn | None = None,
+    db: sqlite3.Connection = Depends(get_db),
+):
+    paid_on = (payment.paid_on if payment and payment.paid_on else date.today())
+    if paid_on > date.today():
+        raise HTTPException(400, "paid_on cannot be in the future")
+
+    inst = db.execute(
+        "SELECT id, loan_id, amount_paise FROM installments WHERE id = ?", (installment_id,)
+    ).fetchone()
+    if not inst:
+        raise HTTPException(404, "Installment not found")
+
+    try:
+        # Only a PENDING installment can be marked PAID. Doing the check inside the
+        # UPDATE itself means two simultaneous requests can't both succeed.
+        updated = db.execute(
+            "UPDATE installments SET status = 'PAID' WHERE id = ? AND status = 'PENDING'",
+            (installment_id,),
+        )
+        if updated.rowcount == 0:
+            raise HTTPException(409, "Installment is already paid")
+
+        db.execute(
+            "INSERT INTO payments (installment_id, paid_on, amount_paise) VALUES (?, ?, ?)",
+            (installment_id, paid_on.isoformat(), inst["amount_paise"]),
+        )
+
+        remaining = db.execute(
+            "SELECT COUNT(*) FROM installments WHERE loan_id = ? AND status = 'PENDING'",
+            (inst["loan_id"],),
+        ).fetchone()[0]
+        if remaining == 0:
+            db.execute("UPDATE loans SET status = 'CLOSED' WHERE id = ?", (inst["loan_id"],))
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    return {
+        "installment_id": installment_id,
+        "loan_id": inst["loan_id"],
+        "amount_paise": inst["amount_paise"],
+        "paid_on": paid_on.isoformat(),
+        "remaining_installments": remaining,
+        "loan_status": "CLOSED" if remaining == 0 else "ACTIVE",
+    }
+
+
+# ---------- Overdue ----------
+
+@app.get("/installments/overdue")
+def overdue_installments(as_of: date | None = None, db: sqlite3.Connection = Depends(get_db)):
+    """Unpaid installments whose due date is before `as_of` (default: today)."""
+    as_of = as_of or date.today()
+    rows = db.execute(
+        """SELECT i.id AS installment_id, i.loan_id, i.installment_no, i.due_date,
+                  i.amount_paise, b.full_name, b.email
+           FROM installments i
+           JOIN loans l     ON l.id = i.loan_id
+           JOIN borrowers b ON b.id = l.borrower_id
+           WHERE i.status = 'PENDING' AND i.due_date < ?
+           ORDER BY i.due_date, i.id""",
+        (as_of.isoformat(),),
+    ).fetchall()
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["days_overdue"] = (as_of - date.fromisoformat(r["due_date"])).days
+        result.append(item)
+    return result
